@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  pipeline:
+    build: .
+    environment:
+      - DEVIN_API_KEY=${DEVIN_API_KEY}
+      - DEVIN_ORG_ID=${DEVIN_ORG_ID}
+      - GH_TOKEN=${GH_TOKEN}
+      - REPO=${REPO}
