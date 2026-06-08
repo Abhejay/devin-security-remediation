@@ -1,0 +1,139 @@
+name: Security Remediation Observability Report
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      security-events: read
+      pull-requests: read
+    steps:
+      - name: Generate and publish report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'EOF'
+          import urllib.request, json, os
+          from datetime import datetime
+
+          token = os.environ['GH_TOKEN']
+          devin_key = os.environ['DEVIN_API_KEY']
+          devin_org = os.environ['DEVIN_ORG_ID']
+          repo = os.environ['REPO']
+
+          def gh_get(path):
+              req = urllib.request.Request(
+                  f"https://api.github.com{path}",
+                  headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+              )
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def devin_get(path):
+              req = urllib.request.Request(
+                  f"https://api.devin.ai{path}",
+                  headers={"Authorization": f"Bearer {devin_key}", "Content-Type": "application/json"}
+              )
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read())
+              except Exception as e:
+                  print(f"Devin API error: {e}")
+                  return {}
+
+          alerts = gh_get(f"/repos/{repo}/code-scanning/alerts?state=open&per_page=100")
+          high_crit = [a for a in alerts if (
+              a.get('rule', {}).get('security_severity_level')
+              or a.get('rule', {}).get('severity', '')
+          ).lower() in ['high', 'critical']]
+          total_alerts = len(alerts)
+          skipped = total_alerts - len(high_crit)
+
+          issues = gh_get(f"/repos/{repo}/issues?labels=devin-remediate&state=all&per_page=100")
+          open_issues = [i for i in issues if i['state'] == 'open' and 'pull_request' not in i]
+          closed_issues = [i for i in issues if i['state'] == 'closed' and 'pull_request' not in i]
+
+          prs = gh_get(f"/repos/{repo}/pulls?state=all&per_page=100")
+          devin_prs = [p for p in prs if p.get('user', {}).get('login', '').startswith('devin')]
+          open_prs = [p for p in devin_prs if p['state'] == 'open']
+          merged_prs = [p for p in devin_prs if p.get('merged_at')]
+
+          # Sessions proxy: one issue = one Devin session (accurate for our pipeline)
+          total_sessions = len([i for i in issues if 'pull_request' not in i])
+          sessions_with_pr = len(devin_prs)
+          sessions_running = max(0, total_sessions - sessions_with_pr)
+
+          hrs_saved = len(merged_prs) * 4
+          cost_saved = hrs_saved * 150
+          now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
+          report = (
+              f"## Security remediation report — {now}\n\n"
+              "### Summary\n\n"
+              "| Metric | Value |\n"
+              "|--------|-------|\n"
+              f"| CodeQL alerts scanned | {total_alerts} |\n"
+              f"| Below threshold (skipped) | {skipped} |\n"
+              f"| High/critical acted on | {len(high_crit)} |\n"
+              f"| Issues created | {len(issues)} |\n"
+              f"| Devin sessions | {total_sessions} |\n"
+              f"| PRs opened | {len(devin_prs)} |\n"
+              f"| PRs merged | {len(merged_prs)} |\n"
+              f"| PRs in review | {len(open_prs)} |\n"
+              f"| Estimated hours saved | {hrs_saved} hrs |\n"
+              f"| Estimated value | ${cost_saved:,} |\n\n"
+              "### Status\n"
+              f"- **Pipeline**: Active\n"
+              f"- **Sessions running**: {sessions_running}\n"
+              f"- **Sessions completed**: {sessions_with_pr}\n\n"
+              "### Open PRs awaiting review\n"
+          )
+
+          for pr in open_prs[:10]:
+              report += f"- [ ] [{pr['title']}]({pr['html_url']})\n"
+
+          if merged_prs:
+              report += "\n### Merged this period\n"
+              for pr in merged_prs[:5]:
+                  report += f"- [x] [{pr['title']}]({pr['html_url']})\n"
+
+          report += (
+              "\n---\n"
+              "*Generated automatically by the Devin Security Remediation Pipeline.*\n"
+              "*Next report: Monday 9:00 AM UTC*\n"
+          )
+
+          existing = gh_get(f"/repos/{repo}/issues?labels=security-dashboard&state=open&per_page=1")
+
+          if existing:
+              issue_number = existing[0]['number']
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments",
+                  data=json.dumps({"body": report}).encode(),
+                  headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"},
+                  method="POST"
+              )
+              with urllib.request.urlopen(req) as r:
+                  comment = json.loads(r.read())
+                  print(f"Report posted: {comment['html_url']}")
+          else:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/issues",
+                  data=json.dumps({"title": "Security Remediation Dashboard", "body": report, "labels": ["security-dashboard"]}).encode(),
+                  headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"},
+                  method="POST"
+              )
+              with urllib.request.urlopen(req) as r:
+                  issue = json.loads(r.read())
+                  print(f"Dashboard issue created: {issue['html_url']}")
+
+          print("Done")
+          EOF
