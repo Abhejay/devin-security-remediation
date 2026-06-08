@@ -1,0 +1,171 @@
+name: Devin Security Remediation Pipeline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-issues-and-remediate:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      security-events: read
+    steps:
+      - name: Fetch alerts, group by file, create issues and trigger Devin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'EOF'
+          import urllib.request, json, os
+          from collections import defaultdict
+
+          token = os.environ['GH_TOKEN']
+          devin_key = os.environ['DEVIN_API_KEY']
+          devin_org = os.environ['DEVIN_ORG_ID']
+          repo = os.environ['REPO']
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/code-scanning/alerts?state=open&per_page=100",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json"
+              }
+          )
+
+          with urllib.request.urlopen(req) as r:
+              alerts = json.loads(r.read())
+
+          print(f"Found {len(alerts)} open CodeQL alerts")
+
+          # Filter to high/critical only, then group by file
+          grouped = defaultdict(list)
+
+          for alert in alerts:
+              severity = (
+                  alert.get('rule', {}).get('security_severity_level')
+                  or alert.get('rule', {}).get('severity', '')
+              ).lower()
+
+              if severity not in ['high', 'critical']:
+                  print(f"Skipping alert #{alert['number']} - severity {severity} below threshold")
+                  continue
+
+              file_path = alert['most_recent_instance']['location']['path']
+              grouped[file_path].append({
+                  'number': alert['number'],
+                  'rule': alert['rule']['description'],
+                  'line': alert['most_recent_instance']['location']['start_line'],
+                  'severity': severity.upper(),
+                  'url': alert['html_url']
+              })
+
+          print(f"Grouped into {len(grouped)} files with high/critical alerts")
+
+          for file_path, file_alerts in grouped.items():
+              file_name = file_path.split('/')[-1]
+              alert_count = len(file_alerts)
+
+              title = f"[Security] {alert_count} vulnerabilit{'y' if alert_count == 1 else 'ies'} in {file_name}"
+
+              findings_text = ""
+              for a in file_alerts:
+                  findings_text += (
+                      f"Finding #{a['number']}\n"
+                      f"- Rule: {a['rule']}\n"
+                      f"- Line: {a['line']}\n"
+                      f"- Severity: {a['severity']}\n"
+                      f"- Alert: {a['url']}\n\n"
+                  )
+
+              body = (
+                  "## Summary\n"
+                  f"CodeQL detected {alert_count} high-severity vulnerabilit{'y' if alert_count == 1 else 'ies'} "
+                  f"in `{file_path}`.\n\n"
+                  "This issue was automatically created by the Devin Security Remediation Pipeline.\n\n"
+                  "## Findings\n"
+                  f"{findings_text}"
+                  "## Expected Fix\n"
+                  "Fix all findings listed above in a single PR.\n"
+                  "Use best practices for each vulnerability type.\n"
+                  "Follow CONTRIBUTING.md, ensure all tests pass,\n"
+                  "and add regression tests before opening the PR.\n\n"
+                  "## Acceptance Criteria\n"
+                  f"- [ ] All {alert_count} CodeQL alerts resolved\n"
+                  "- [ ] All existing tests pass\n"
+                  "- [ ] Regression tests added\n"
+              )
+
+              issue_payload = {
+                  "title": title,
+                  "body": body,
+                  "labels": ["devin-remediate"]
+              }
+
+              issue_req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/issues",
+                  data=json.dumps(issue_payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json"
+                  },
+                  method="POST"
+              )
+
+              with urllib.request.urlopen(issue_req) as r:
+                  issue = json.loads(r.read())
+                  issue_number = issue['number']
+                  issue_url = issue['html_url']
+                  print(f"Created issue #{issue_number}: {title}")
+
+              # Build prompt listing all alerts in this file
+              alert_lines = ""
+              for a in file_alerts:
+                  alert_lines += (
+                      f"- Rule: {a['rule']}, Line: {a['line']}, "
+                      f"Severity: {a['severity']}, Alert: {a['url']}\n"
+                  )
+
+              prompt = (
+                  f"Fix ALL of the following security vulnerabilities in a single PR "
+                  f"for https://github.com/{repo}\n\n"
+                  f"File: {file_path}\n\n"
+                  f"Vulnerabilities to fix ({alert_count} total):\n"
+                  f"{alert_lines}\n"
+                  f"GitHub Issue: {issue_url}\n\n"
+                  "Fix every vulnerability listed above in the same branch and PR. "
+                  "Do not open separate PRs per vulnerability."
+              )
+
+              tags = ["auto-remediation", "codeql", f"issue-{issue_number}"]
+
+              session_payload = {
+                  "prompt": prompt,
+                  "playbook_id": "3fee2c273b954537bae8030a3029937e",
+                  "tags": tags,
+                  "session_type": "refactoring_and_optimization"
+              }
+
+              session_req = urllib.request.Request(
+                  f"https://api.devin.ai/v3/organizations/{devin_org}/sessions",
+                  data=json.dumps(session_payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {devin_key}",
+                      "Content-Type": "application/json"
+                  },
+                  method="POST"
+              )
+
+              try:
+                  with urllib.request.urlopen(session_req) as r:
+                      session = json.loads(r.read())
+                      session_id = session.get('session_id', 'unknown')
+                      print(f"Devin session created: {session_id}")
+                      print(f"View at: https://app.devin.ai/sessions/{session_id}")
+              except urllib.error.HTTPError as e:
+                  print(f"Devin API error {e.code}: {e.read().decode()}")
+
+          print("Done")
+          EOF
