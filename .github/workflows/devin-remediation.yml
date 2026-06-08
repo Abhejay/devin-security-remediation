@@ -1,0 +1,84 @@
+name: Devin Auto-Remediation
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to remediate"
+        required: true
+
+jobs:
+  triage-and-remediate:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Triage
+        id: triage
+        run: |
+          if [[ "${{ github.event_name }}" == "issues" && "${{ github.event.label.name }}" == "devin-remediate" ]]; then
+            echo "Manual trigger via label - queuing Devin remediation"
+            echo "should_remediate=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Manual workflow dispatch - queuing Devin remediation"
+            echo "should_remediate=true" >> $GITHUB_OUTPUT
+          else
+            echo "Condition not met - skipping"
+            echo "should_remediate=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Devin Session
+        if: steps.triage.outputs.should_remediate == 'true'
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          python3 - <<'EOF'
+          import os, json, urllib.request
+
+          prompt = (
+              "You are fixing a security vulnerability in the Apache Superset fork "
+              "at https://github.com/Abhejay/superset\n\n"
+              f"Issue #{os.environ.get('ISSUE_NUMBER')}: {os.environ.get('ISSUE_TITLE')}\n\n"
+              f"Details:\n{os.environ.get('ISSUE_BODY')}\n\n"
+              f"Reference: {os.environ.get('ISSUE_URL')}\n\n"
+              "Instructions:\n"
+              "1. Clone the repository and investigate the vulnerability at the exact file and line specified\n"
+              "2. Fix it using best practices - not a naive patch, use the proper library or pattern for this vulnerability type\n"
+              "3. Follow the conventions in CONTRIBUTING.md\n"
+              "4. Ensure all existing tests pass and add a regression test for the fix\n"
+              "5. Open a PR describing: what the vulnerability was, what you changed, and why it is safe to merge\n"
+              f"6. Link the PR to issue #{os.environ.get('ISSUE_NUMBER')}\n"
+          )
+
+          payload = {
+              "prompt": prompt,
+              "tags": [
+                  "auto-remediation",
+                  "codeql",
+                  f"issue-{os.environ.get('ISSUE_NUMBER')}"
+              ],
+              "session_type": "refactoring_and_optimization"
+          }
+
+          req = urllib.request.Request(
+              f"https://api.devin.ai/v3/organizations/{os.environ['DEVIN_ORG_ID']}/sessions",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Authorization": f"Bearer {os.environ['DEVIN_API_KEY']}",
+                  "Content-Type": "application/json"
+              },
+              method="POST"
+          )
+
+          with urllib.request.urlopen(req) as response:
+              result = json.loads(response.read())
+              session_id = result.get('session_id', 'unknown')
+              print(f"Devin session created: {session_id}")
+              print(f"View at: https://app.devin.ai/sessions/{session_id}")
+          EOF
